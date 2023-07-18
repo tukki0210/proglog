@@ -17,18 +17,20 @@ type segment struct {
 	config     Config
 }
 
-// 新しいセグメントを作成する
 // segment構造体の初期化関数を定義している
-// 初期化関数はしばしばポインタを返す仕様とする
-// この関数は、ディレクトリ、ベースオフセット、設定を受け取り、
+// 初期化関数はしばしばポインタを返す仕様とすることがある
+// AppendやRemoveなどのメソッドがレシーバ(s segment)の値を変更するため、ポインタを返す必要がある
+// このような初期化関数を定義することで、構造体の初期化時にポインタを返すことを明示的にすることができる
+
 func newSegment(dir string, baseOffset uint64, c Config) (*segment, error) {
 
-	// ファイルを作成する
+	// セグメント構造体リテラルの作成
 	s := &segment{
 		baseOffset: baseOffset,
 		config:     c,
 	}
 
+	// *os.Fileを作成する
 	storeFile, err := os.OpenFile(
 		filepath.Join(dir, fmt.Sprintf("%d%s", baseOffset, ".store")),
 		os.O_RDWR|os.O_CREATE|os.O_APPEND,
@@ -40,7 +42,7 @@ func newSegment(dir string, baseOffset uint64, c Config) (*segment, error) {
 	}
 
 	// ストアを作成する
-	if s.stroe, err := s.newStore(storeFile); err != nil {
+	if s.store, err = newStore(storeFile); err != nil {
 		return nil, err
 	}
 
@@ -56,13 +58,10 @@ func newSegment(dir string, baseOffset uint64, c Config) (*segment, error) {
 	}
 
 	// インデックスを作成する
-	if s.index, err := s.newIndex(indexFile, c); err != nil {
+	if s.index, err = newIndex(indexFile, c); err != nil {
 		return nil, err
 	}
-	// インデックスを読み込む
-	if err := s.index.Read(s.store); err != nil {
-		return nil, err
-	}
+
 	// 次のオフセットを計算する
 	if off, _, err := s.index.Read(-1); err != nil {
 		s.nextOffset = baseOffset
@@ -73,7 +72,7 @@ func newSegment(dir string, baseOffset uint64, c Config) (*segment, error) {
 }
 
 // セグメントにレコードを追加する
-func (s *segment) Append(record *api.Record) (offset uint64, err error){
+func (s *segment) Append(record *api.Record) (offset uint64, err error) {
 	cur := s.nextOffset
 	record.Offset = cur
 	p, err := proto.Marshal(record)
@@ -87,7 +86,7 @@ func (s *segment) Append(record *api.Record) (offset uint64, err error){
 	}
 
 	if err := s.index.Write(
-		uint32(s.nextOffset - s.baseOffset),
+		uint32(s.nextOffset-s.baseOffset),
 		pos,
 	); err != nil {
 		return 0, err
@@ -97,7 +96,7 @@ func (s *segment) Append(record *api.Record) (offset uint64, err error){
 }
 
 // セグメントからレコードを読み込む
-func (s *segment) Read(off uint64) (*api.Record, error){
+func (s *segment) Read(off uint64) (*api.Record, error) {
 	_, pos, err := s.index.Read(int64(off - s.baseOffset))
 	if err != nil {
 		return nil, err
@@ -114,7 +113,7 @@ func (s *segment) Read(off uint64) (*api.Record, error){
 
 func (s *segment) IsMaxed() bool {
 	return s.store.size >= s.config.Segment.MaxStoreBytes ||
-		s.index.size >= s.config.Segment.MaxIndexBytes || 
+		s.index.size >= s.config.Segment.MaxIndexBytes ||
 		s.index.isMaxed()
 }
 

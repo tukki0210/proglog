@@ -23,14 +23,14 @@ type store struct {
 	size uint64
 }
 
-// 新しくストアを作成する
+// ストア構造体の初期化関数を定義する
 func newStore(f *os.File) (*store, error){
 
 	fi, err := os.Stat(f.Name())
 	if err != nil {
 		return nil, err
 	}
-	// get the size of the file
+	
 	size := uint64(fi.Size())
 
 	// return a new store struct
