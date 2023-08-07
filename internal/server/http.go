@@ -16,13 +16,13 @@ func NewHTTPServer(addr string) *http.Server {
 		Addr: addr,
 		Handler: r,
 	}
-
 }
+
 
 type httpServer struct {
 	Log *Log
 }
-
+// httpServerのFactory()
 func newHTTPServer() *httpServer {
 	return &httpServer{
 		Log: NewLog(),
