@@ -4,18 +4,21 @@ import (
 	"context"
 	"net"
 	"os"
+
+	// "fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	api "github.com/tukki0210/proglog/api/v1"
-	"github.com/tukki0210/proglog/internal/log"
+	"github.com/tukki0210/proglog/internal/auth"
 	"github.com/tukki0210/proglog/internal/config"
+	"github.com/tukki0210/proglog/internal/log"
 	"google.golang.org/grpc"
-	// codes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/codes"
+
 	// "google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/credentials"
-	// "google.golang.org/grpc/status"
-
+	"google.golang.org/grpc/status"
 )
 
 // テストケーsの一覧を定義
@@ -23,13 +26,15 @@ func TestServer(t *testing.T) {
 	for scenario, fn := range map[string]func(
 		// mapの値の関数の引数
 		t *testing.T,
-		client api.LogClient,
+		rootClient api.LogClient,
+		nobodyClient api.LogClient,
 		config *Config,
 	){
 		// key:シナリオの説明、value:シナリオをテストするための関数
 		"produce/consume a message to/from the log succeeds": testProduceConsume,
 		"consume past log boundary fails":                    testConsumePastBoundary,
 		"produce/consume stream succeeds":                    testProduceConsumeStream,
+		"unauthorized fails":                                 testUnauthorized,
 	} {
 		// forループの中
 		t.Run(
@@ -38,18 +43,19 @@ func TestServer(t *testing.T) {
 			// 第２引数：テストケースの実行内容
 			func(t *testing.T) {
 				// 各シナリオの設定を行う
-				client, config, teardown := setupTest(t, nil)
+				rootClient, nobodyClient, config, teardown := setupTest(t, nil)
 				// テストが終わった後のクリーンアップを行う
 				defer teardown()
 				// 具体的なテストシナリオの実行
-				fn(t, client, config)
+				fn(t, rootClient, nobodyClient, config)
 			})
 	}
 }
 
 func setupTest(t *testing.T, fn func(*Config)) (
 	// 戻り値
-	client api.LogClient,
+	rootClient api.LogClient,
+	nobodyClient api.LogClient,
 	cfg *Config,
 	teardown func(),
 ) {
@@ -58,41 +64,51 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	// clientOptions := []grpc.DialOption{
-	// 	grpc.WithTransportCredentials(insecure.NewCredentials())}
-	// cc, err := grpc.Dial(l.Addr().String(), clientOptions...)
-	// require.NoError(t, err)
-
 	// クライアントのTLS設定
-	clientTLSConfig, err := config.SetupTLSConfig(
-		config.TLSConfig{
-			CAFile:config.CAFile,
-			CertFile:config.ClientCertFile,
-			KeyFile:config.ClientKeyFile,
+
+	newClient := func(certPath, keyPath string) (
+		*grpc.ClientConn,
+		api.LogClient,
+		[]grpc.DialOption,
+	) {
+		tlsConfig, err := config.SetupTLSConfig(config.TLSConfig{
+			CAFile:   config.CAFile,
+			CertFile: certPath,
+			KeyFile:  keyPath,
+			Server:   false,
 		})
-	require.NoError(t, err)
+		require.NoError(t, err)
+		tlsCreds := credentials.NewTLS(tlsConfig)
+		opts := []grpc.DialOption{grpc.WithTransportCredentials(tlsCreds)}
+		conn, err := grpc.Dial(l.Addr().String(), opts...)
+		require.NoError(t, err)
+		client := api.NewLogClient(conn)
+		return conn, client, opts
+	}
 
-	clientCreds := credentials.NewTLS(clientTLSConfig)
-
-	cc, err := grpc.Dial(
-		l.Addr().String(),
-		grpc.WithTransportCredentials(clientCreds),
+	// rootユーザーのクライアント
+	var rootConn *grpc.ClientConn
+	rootConn, rootClient, _ = newClient(
+		config.RootClientCertFile,
+		config.RootClientKeyFile,
 	)
-	require.NoError(t, err)
 
-	client = api.NewLogClient(cc)
+	// nobodyユーザーのクライアント
+	var nobodyConn *grpc.ClientConn
+	nobodyConn, nobodyClient, _ = newClient(
+		config.NobodyClientCertFile,
+		config.NobodyClientKeyFile,
+	)
 
 	// サーバーのTLS設定
-	serverTLSConfig, err := config.SetupTLSConfig(
-		config.TLSConfig{
-			CertFile: config.ServerCertFile,
-			KeyFile: config.ServerKeyFile,
-			CAFile: config.CAFile,
-			ServerAddress: l.Addr().String(),
-			Server: true,
-		})
+	serverTLSConfig, err := config.SetupTLSConfig(config.TLSConfig{
+		CertFile:      config.ServerCertFile,
+		KeyFile:       config.ServerKeyFile,
+		CAFile:        config.CAFile,
+		ServerAddress: l.Addr().String(),
+		Server:        true,
+	})
 	require.NoError(t, err)
-
 	serverCreds := credentials.NewTLS(serverTLSConfig)
 
 	dir, err := os.MkdirTemp("", "server-test")
@@ -101,13 +117,16 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	clog, err := log.NewLog(dir, log.Config{})
 	require.NoError(t, err)
 
+	authorizer := auth.New(config.ACLModelFile, config.ACLPolicyFile)
 	cfg = &Config{
-		CommitLog: clog,
+		CommitLog:  clog,
+		Authorizer: authorizer,
 	}
 
 	if fn != nil {
 		fn(cfg)
 	}
+
 	server, err := NewGRPCServer(cfg, grpc.Creds(serverCreds))
 	require.NoError(t, err)
 
@@ -115,17 +134,16 @@ func setupTest(t *testing.T, fn func(*Config)) (
 		server.Serve(l)
 	}()
 
-	client = api.NewLogClient(cc)
-
-	return client, cfg, func() {
-		cc.Close()
+	return rootClient, nobodyClient, cfg, func() {
+		rootConn.Close()
+		nobodyConn.Close()
 		server.Stop()
 		l.Close()
-		// clog.Remove()
+
 	}
 }
 
-func testProduceConsume(t *testing.T, client api.LogClient, config *Config) {
+func testProduceConsume(t *testing.T, client, _ api.LogClient, config *Config) {
 	ctx := context.Background()
 
 	want := &api.Record{
@@ -150,15 +168,18 @@ func testProduceConsume(t *testing.T, client api.LogClient, config *Config) {
 	require.Equal(t, want.Offset, consume.Record.Offset)
 }
 
-func testConsumePastBoundary(t *testing.T, client api.LogClient, config *Config) {
+func testConsumePastBoundary(
+	t *testing.T,
+	client, _ api.LogClient,
+	config *Config,
+) {
 	ctx := context.Background()
 
-	produce, err := client.Produce(
-		ctx,
-		&api.ProduceRequest{
-			Record: &api.Record{Value: []byte("hello world")},
+	produce, err := client.Produce(ctx, &api.ProduceRequest{
+		Record: &api.Record{
+			Value: []byte("hello world"),
 		},
-	)
+	})
 	require.NoError(t, err)
 
 	consume, _ := client.Consume(ctx, &api.ConsumeRequest{
@@ -167,36 +188,34 @@ func testConsumePastBoundary(t *testing.T, client api.LogClient, config *Config)
 	if consume != nil {
 		t.Fatal("consume not nil")
 	}
-
 	// got := status.Code(err)
 	// want := codes.OutOfRange
 	// if got != want {
-	// 	t.Fatalf("got err: %v, want err: %v", got, want)
+	// 	t.Fatalf("got err: %v, want: %v", got, want)
 	// }
 }
 
 func testProduceConsumeStream(
 	t *testing.T,
-	client api.LogClient,
+	client, _ api.LogClient,
 	config *Config,
-){
+) {
 	ctx := context.Background()
 
-	records := []*api.Record{
-		{
-			Value: []byte("first message"),
-			Offset: 0,
-		},
-		{
-			Value: []byte("second message"),
-			Offset: 1,
-		}}
+	records := []*api.Record{{
+		Value:  []byte("first message"),
+		Offset: 0,
+	}, {
+		Value:  []byte("second message"),
+		Offset: 1,
+	}}
+
 	{
 		stream, err := client.ProduceStream(ctx)
 		require.NoError(t, err)
 
 		for offset, record := range records {
-			err := stream.Send(&api.ProduceRequest{
+			err = stream.Send(&api.ProduceRequest{
 				Record: record,
 			})
 			require.NoError(t, err)
@@ -213,8 +232,8 @@ func testProduceConsumeStream(
 	}
 	{
 		stream, err := client.ConsumeStream(
-			ctx, 
-			&api.ConsumeRequest{Offset:0},
+			ctx,
+			&api.ConsumeRequest{Offset: 0},
 		)
 		require.NoError(t, err)
 
@@ -222,9 +241,47 @@ func testProduceConsumeStream(
 			res, err := stream.Recv()
 			require.NoError(t, err)
 			require.Equal(t, res.Record, &api.Record{
-				Value: record.Value,
+				Value:  record.Value,
 				Offset: uint64(i),
 			})
 		}
+	}
+}
+
+func testUnauthorized(
+	t *testing.T,
+	_,
+	client api.LogClient,
+	config *Config,
+) {
+	ctx := context.Background()
+	produce, err := client.Produce(ctx,
+		&api.ProduceRequest{
+			Record: &api.Record{
+				Value: []byte("hello world"),
+			},
+		},
+	)
+
+	if produce != nil {
+		t.Fatal("produce not nil")
+	}
+
+	gotCode, wantCode := status.Code(err), codes.PermissionDenied
+	if gotCode != wantCode {
+		t.Fatalf("got code: %s, want: %s", gotCode, wantCode)
+	}
+
+	consume, err := client.Consume(ctx,
+		&api.ConsumeRequest{
+			Offset: 0,
+		})
+	if consume != nil {
+		t.Fatal("consume not nil")
+	}
+
+	gotCode, wantCode = status.Code(err), codes.PermissionDenied
+	if gotCode != wantCode {
+		t.Fatalf("got code: %s, want: %s", gotCode, wantCode)
 	}
 }
