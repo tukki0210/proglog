@@ -2,12 +2,23 @@ package server
 
 import (
 	"context"
+	"strings"
+	"time"
+
 	"fmt"
 
 	api "github.com/tukki0210/proglog/api/v1"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_auth "github.com/grpc-ecosystem/go-grpc-middleware/auth"
+	grpc_zap "github.com/grpc-ecosystem/go-grpc-middleware/logging/zap"
+	grpc_ctxtags "github.com/grpc-ecosystem/go-grpc-middleware/tags"
+
+	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/stats/view"
+	"go.opencensus.io/trace"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -56,13 +67,52 @@ func newgrpcServer(config *Config) (srv *grpcServer, err error) {
 }
 
 func NewGRPCServer(config *Config, grpcOpts ...grpc.ServerOption) (*grpc.Server, error) {
+
+	logger := zap.L().Named("server")
+	zapOpts := []grpc_zap.Option{
+		grpc_zap.WithDurationField(
+			func(duration time.Duration) zapcore.Field {
+				return zap.Int64(
+					"grpc.time_ns",
+					duration.Nanoseconds(),
+				)
+			},
+		),
+	}
+
+	trace.ApplyConfig(trace.Config{
+		DefaultSampler: trace.AlwaysSample(),
+	})
+	if err := view.Register(
+		ocgrpc.DefaultServerViews...,
+	); err != nil {
+		return nil, err
+	}
+
+	halfSampler := trace.ProbabilitySampler(0.5)
+	trace.ApplyConfig(trace.Config{
+		DefaultSampler: func(p trace.SamplingParameters) trace.SamplingDecision {
+			if strings.Contains(p.Name, "Produce") {
+				return trace.SamplingDecision{Sample: true}
+			}
+			return halfSampler(p)
+		},
+	})
+
 	grpcOpts = append(grpcOpts, grpc.StreamInterceptor(
+		// ミドルウェアを追加するために、grpc_middlewareパッケージのChainStreamServer関数を呼び出す
 		grpc_middleware.ChainStreamServer(
+			grpc_ctxtags.StreamServerInterceptor(),
+			grpc_zap.StreamServerInterceptor(logger, zapOpts...),
 			grpc_auth.StreamServerInterceptor(authenticate),
 	)), grpc.UnaryInterceptor(
 		grpc_middleware.ChainUnaryServer(
+			grpc_ctxtags.UnaryServerInterceptor(),
+			grpc_zap.UnaryServerInterceptor(logger, zapOpts...),
 			grpc_auth.UnaryServerInterceptor(authenticate),
-	)))
+	)),
+	grpc.StatsHandler(&ocgrpc.ServerHandler{}),
+	)
 
 	gsrv := grpc.NewServer(grpcOpts...)
 	srv, err := newgrpcServer(config)
